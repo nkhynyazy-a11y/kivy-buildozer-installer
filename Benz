@@ -1,0 +1,150 @@
+# فایل: chah_motor_benz.py
+# نام برنامه: چاه‌موتور بنز
+
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+from kivy.clock import Clock
+from persiantools.jdatetime import JalaliDateTime
+import sqlite3
+from datetime import datetime
+
+# -------- دیتابیس SQLite --------
+conn = sqlite3.connect("chah_motor_benz.db")
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS farmers
+             (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, phone TEXT, start_hour INTEGER, end_hour INTEGER)''')
+c.execute('''CREATE TABLE IF NOT EXISTS alerts
+             (farmer_id INTEGER, alert_12h_sent INTEGER DEFAULT 0, alert_1h_sent INTEGER DEFAULT 0,
+              start_alert_sent INTEGER DEFAULT 0, end_alert_sent INTEGER DEFAULT 0)''')
+conn.commit()
+
+# -------- Twilio پیامک --------
+from twilio.rest import Client
+
+TWILIO_SID = "SID_شما"
+TWILIO_AUTH = "AUTH_شما"
+TWILIO_PHONE = "+10000000000"
+
+def send_sms(to_number, message):
+    client = Client(TWILIO_SID, TWILIO_AUTH)
+    client.messages.create(body=message, from_=TWILIO_PHONE, to=to_number)
+
+# -------- رابط کاربری موبایل --------
+class ChahMotorBenzApp(App):
+    def build(self):
+        self.title = "چاه‌موتور بنز"
+        main_layout = BoxLayout(orientation='vertical', padding=15, spacing=10)
+        
+        # وضعیت کل
+        self.status_label = Label(text="وضعیت آب‌دهی", font_size=22, size_hint_y=None, height=50)
+        main_layout.add_widget(self.status_label)
+        
+        # فرم ثبت کشاورز
+        form_layout = GridLayout(cols=2, spacing=5, size_hint_y=None, height=180)
+        self.name_input = TextInput(hint_text="نام", multiline=False)
+        self.phone_input = TextInput(hint_text="شماره تلفن", multiline=False)
+        self.start_input = TextInput(hint_text="ساعت شروع (0-23)", multiline=False)
+        self.end_input = TextInput(hint_text="ساعت پایان (0-23)", multiline=False)
+        
+        form_layout.add_widget(Label(text="نام:", halign="right"))
+        form_layout.add_widget(self.name_input)
+        form_layout.add_widget(Label(text="شماره تلفن:", halign="right"))
+        form_layout.add_widget(self.phone_input)
+        form_layout.add_widget(Label(text="ساعت شروع:", halign="right"))
+        form_layout.add_widget(self.start_input)
+        form_layout.add_widget(Label(text="ساعت پایان:", halign="right"))
+        form_layout.add_widget(self.end_input)
+        
+        main_layout.add_widget(form_layout)
+        
+        self.add_btn = Button(text="ثبت کشاورز", size_hint_y=None, height=40)
+        self.add_btn.bind(on_press=self.add_farmer)
+        main_layout.add_widget(self.add_btn)
+        
+        # جدول روزانه
+        self.scroll = ScrollView(size_hint=(1, 1))
+        self.grid = GridLayout(cols=1, spacing=5, size_hint_y=None)
+        self.grid.bind(minimum_height=self.grid.setter('height'))
+        self.scroll.add_widget(self.grid)
+        main_layout.add_widget(self.scroll)
+        
+        # بروزرسانی هر دقیقه
+        Clock.schedule_interval(self.update_status, 60)
+        
+        return main_layout
+    
+    def add_farmer(self, instance):
+        name = self.name_input.text.strip()
+        phone = self.phone_input.text.strip()
+        try:
+            start_hour = int(self.start_input.text)
+            end_hour = int(self.end_input.text)
+        except:
+            self.status_label.text = "لطفاً ساعت را به صورت عدد وارد کنید"
+            return
+        
+        c.execute("INSERT INTO farmers (name, phone, start_hour, end_hour) VALUES (?, ?, ?, ?)",
+                  (name, phone, start_hour, end_hour))
+        conn.commit()
+        c.execute("INSERT INTO alerts (farmer_id) VALUES (?)", (c.lastrowid,))conn.commit()
+        
+        self.status_label.text = f"کشاورز {name} ثبت شد"
+        self.name_input.text = ""
+        self.phone_input.text = ""
+        self.start_input.text = ""
+        self.end_input.text = ""
+    
+    def update_status(self, dt):
+        now = datetime.now()
+        now_hour = now.hour
+        date_shamsi = JalaliDateTime.now().strftime("%Y/%m/%d %H:%M")
+        
+        c.execute("SELECT id, name, phone, start_hour, end_hour FROM farmers")
+        farmers = c.fetchall()
+        active_farmers = []
+        
+        for f in farmers:
+            fid, name, phone, start, end = f
+            if start <= now_hour < end:
+                active_farmers.append(name)
+            
+            # بررسی هشدارها
+            c.execute("SELECT alert_12h_sent, alert_1h_sent, start_alert_sent, end_alert_sent FROM alerts WHERE farmer_id=?", (fid,))
+            alert = c.fetchone()
+            if alert:
+                alert_12h, alert_1h, alert_start, alert_end = alert
+                if not alert_12h and now_hour == start - 12:
+                    send_sms(phone, f"هشدار: نوبت آبیاری شما 12 ساعت دیگر شروع می‌شود.")
+                    c.execute("UPDATE alerts SET alert_12h_sent=1 WHERE farmer_id=?", (fid,))
+                if not alert_1h and now_hour == start - 1:
+                    send_sms(phone, f"هشدار: نوبت آبیاری شما 1 ساعت دیگر شروع می‌شود.")
+                    c.execute("UPDATE alerts SET alert_1h_sent=1 WHERE farmer_id=?", (fid,))
+                if not alert_start and now_hour == start:
+                    send_sms(phone, f"شروع نوبت آبیاری شما")
+                    c.execute("UPDATE alerts SET start_alert_sent=1 WHERE farmer_id=?", (fid,))
+                if not alert_end and now_hour == end:
+                    send_sms(phone, f"نوبت آبیاری شما پایان یافت")
+                    c.execute("UPDATE alerts SET end_alert_sent=1 WHERE farmer_id=?", (fid,))
+        
+        conn.commit()
+        
+        # بروزرسانی جدول نمایش
+        self.grid.clear_widgets()
+        for f in farmers:
+            fid, name, phone, start, end = f
+            status = "در حال آبیاری" if start <= now_hour < end else "آماده"
+            label = Label(text=f"{name}: {start}:00 - {end}:00 | {status}", size_hint_y=None, height=30)
+            self.grid.add_widget(label)
+        
+        if active_farmers:
+            self.status_label.text = f"{date_shamsi}\nدر حال آبیاری: " + ", ".join(active_farmers)
+        else:
+            self.status_label.text = f"{date_shamsی}\nهیچ کشاورزی در حال آبیاری نیست"
+
+if name == "__main__":
+    ChahMotorBenzApp().run()
